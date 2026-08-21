@@ -31,7 +31,13 @@ BRANDS = {
     "TAE PARK": "https://www.tae-park.com/products.json",
     "HYEIN SEO": "https://hyeinseo.com/products.json",
     "BAD BINCH TONGTONG": "https://badbinch.com/products.json",
-    "LUU DAN": "https://luu-dan.com/products.json"
+    "LUU DAN": "https://luu-dan.com/products.json",
+    "KARTIK RESEARCH": "https://www.kartikresearch.com/products.json",
+    "TAIGA TAKAHASHI": "https://taigatakahashi.com/en/products.json",
+    "DOUBLET": "https://shop.doublet-jp.com/en/products.json",
+    "PENG TAI": "https://uj-ng.com/collections/women-peng-tai/products.json",
+    "TIRADOS": "https://www.tirados.co/products.json",
+    "FRIZMWORKS": "https://frizmworks.eu/products.json"
 }
 
 RELEVANT_DATA = ["BRAND", "PRODUCT NAME", "PRODUCT TYPE", "ID", "PRICE", "FABRIC COMPOSITION"]
@@ -39,7 +45,7 @@ WORKING_DIRECTORY = "C:\\Users\\eddie\\Desktop\\Coding\\Python\\fabric-compositi
 OUTPUT_CSV = "clothing_brand_products.csv"
 CLUSTERED_CSV = "clothing_brand_products_clustered.csv"
 SCRIPT_NAME = "scrape_and_cluster"
-N_CLUSTERS = 8
+N_CLUSTERS = 4
 MAX_K = 11
 
 # Extract fabric composition information (assumed to be in "body_html" field) using regex
@@ -79,14 +85,92 @@ def scrape_brand_data(brands: dict, output_csv_path: str) -> None:
             else:
                 print(f"Failed to fetch data for {brand}, got status code: {response.status_code})")
 
+# Recognized textile fiber vocabulary: canonical name -> regex patterns that identify it.
+# This works as an ALLOWLIST rather than a blocklist. Real-world textile fibers are a
+# small, well-documented, essentially closed set, so checking extracted text against
+# this vocabulary scales far better than trying to blacklist every possible junk phrase
+# a page's body_html might contain (e.g. "Designed in Italy" getting mis-captured as a
+# material). Anything that matches no known fiber is treated as noise and dropped - no
+# manual junk list to maintain.
+#
+# More specific/premium variants are listed BEFORE their generic parent so they're
+# matched first and kept as distinct categories (e.g. "pima cotton" stays separate
+# from plain "cotton"; "merino wool" stays separate from plain "wool").
+FIBER_VOCABULARY = [
+    ("pima cotton",        [r"\bpima\b"]),
+    ("egyptian cotton",    [r"\begyptian\b"]),
+    ("organic cotton",     [r"\borganic\b.*\bcotton\b", r"\bcotton\b.*\borganic\b"]),
+    ("combed cotton",      [r"\bcombed\b", r"\bairlume\b"]),
+    ("cotton",             [r"\bcotton\b"]),
+
+    ("merino wool",        [r"\bmerino\b"]),
+    ("cashmere",           [r"\bcashmere\b"]),
+    ("mohair",             [r"\bmohair\b"]),
+    ("lambswool",          [r"\blambswool\b", r"lamb.?s\s*wool"]),
+    ("alpaca",             [r"\balpaca\b"]),
+    ("camel hair",         [r"\bcamel\b"]),
+    ("yak wool",           [r"\byak\b"]),
+    ("wool",               [r"\bwool\b"]),
+
+    ("silk",               [r"\bsilk\b", r"\bmulberry\b"]),
+    ("linen",              [r"\blinen\b"]),
+    ("ramie",              [r"\bramie\b"]),
+    ("hemp",               [r"\bhemp\b"]),
+
+    ("recycled polyester", [r"recycled.*polyester"]),
+    ("polyester",          [r"\bpolyester\b", r"\bpoly\b"]),
+    ("recycled nylon",     [r"recycled.*nylon"]),
+    ("nylon",              [r"\bnylon\b"]),
+    ("spandex",            [r"\bspandex\b", r"\belastane\b"]),
+    ("polyamide",          [r"\bpolyamide\b"]),
+    ("polyurethane",       [r"\bpolyurethane\b"]),
+    ("polyethylene",       [r"\bpolyethylene\b"]),
+    ("acrylic",            [r"\bacryl"]),
+    ("acetate",            [r"\bacetate\b"]),
+
+    ("tencel/lyocell",     [r"\btencel\b", r"\blyocell\b"]),
+    ("modal",              [r"\bmodal\b"]),
+    ("viscose/rayon",      [r"\bviscose\b", r"\brayon\b", r"\becovero\b", r"\bcupro\b"]),
+
+    ("leather",            [r"\bleather\b", r"\bnappa\b"]),
+]
+
+
+def normalize_material_name(raw_name: str):
+    """Maps a messy, regex-extracted material name to a canonical fiber name by
+    checking it against a known textile-fiber vocabulary. Returns None if no known
+    fiber is found in the text - meaning it's treated as noise (e.g. text captured
+    from unrelated body copy like "Designed in Italy") rather than an actual material.
+    No manual junk list required: anything outside the recognized vocabulary is
+    automatically dropped."""
+    name = re.sub(r"\s+", " ", raw_name.lower().strip())
+
+    for canonical, patterns in FIBER_VOCABULARY:
+        if any(re.search(p, name) for p in patterns):
+            return canonical
+
+    return None  # no recognized fiber found in this text -> treat as noise
+
+
 def reformat_fabric_composition(fabric_str: str) -> dict:
     # Converts format from '69% Cotton, 25% Polyamid, 6% Elastane' → {'cotton': 69, …}
+    # Validates each extracted fragment against a known fiber vocabulary, merging
+    # true synonyms (e.g. "elastane" -> "spandex") while keeping premium/distinct
+    # subtypes separate (e.g. "pima cotton" != "cotton") and silently dropping
+    # fragments that aren't recognizable fiber names at all.
     if not fabric_str or fabric_str == "N/A" or not isinstance(fabric_str, str):
         print("fabric_str is not in the expected format: ", fabric_str)
         return {}
     pattern = r'(\d+)%\s*([\w\s]+?)(?=,|$)'
     matches = re.findall(pattern, fabric_str, re.IGNORECASE)
-    return {match.strip().lower(): int(percent) for percent, match in matches}
+
+    result = {}
+    for percent, raw_material in matches:
+        canonical = normalize_material_name(raw_material)
+        if canonical is None:
+            continue
+        result[canonical] = result.get(canonical, 0) + int(percent)
+    return result
 
 # Returns (X, material_names) where X is the matrix we will use for the clustering
 def build_material_matrix(df: pd.DataFrame) -> tuple:
@@ -136,12 +220,19 @@ def visualize_clusters(df: pd.DataFrame, X) -> None:
     pca = PCA(n_components=2)
     cluster_centers = pca.fit_transform(X)
 
+    # Label each axis with its top-loading material and the variance it explains
+    loadings = pd.DataFrame(pca.components_.T, index=X.columns, columns=["PC1", "PC2"])
+    pc1_label = loadings["PC1"].abs().idxmax()
+    pc2_label = loadings["PC2"].abs().idxmax()
+    var = pca.explained_variance_ratio_
+
     plt.scatter(cluster_centers[:, 0], cluster_centers[:, 1], c=df["cluster"])
     plt.title("Product Clusters by Fabric Composition (PCA)")
-    plt.xlabel("PCA Component 1")
-    plt.ylabel("PCA Component 2")
+    plt.xlabel(f"PCA Component 1 (~{pc1_label}, {var[0]*100:.0f}% var)")
+    plt.ylabel(f"PCA Component 2 (~{pc2_label}, {var[1]*100:.0f}% var)")
     plt.savefig(WORKING_DIRECTORY + "\\cluster_plot.png")
     plt.show()
+    print(f"Explained variance: PC1={var[0]*100:.1f}%, PC2={var[1]*100:.1f}%, total={var.sum()*100:.1f}%")
     print("Plot saved as cluster_plot.png\n")
 
 # Creates a PDF file containig all code from this file
