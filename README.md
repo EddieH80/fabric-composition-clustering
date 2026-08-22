@@ -3,4 +3,4 @@ Version control for k-means clustering on different fabric compositions for prod
 
 ![Elbow plot for determining optimal number of clusters](/elbow_plot.png)
 
-![Cluster graph for fabric composition of products](/cluster_lot.png)
+![Cluster graph for fabric composition of products](/cluster_plot.png)
