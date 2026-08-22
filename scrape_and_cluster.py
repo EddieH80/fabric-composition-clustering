@@ -2,12 +2,14 @@ import re
 import json
 import requests
 import csv
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from fpdf import FPDF
 from bs4 import BeautifulSoup
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+import matplotlib.ticker as mticker
 
 # Constants
 BRANDS = {
@@ -179,6 +181,8 @@ def build_material_matrix(df: pd.DataFrame) -> tuple:
     all_materials = set()
     df["fabric_parsed"].apply(lambda x: all_materials.update(x.keys()))
 
+    df["premium_fiber_pct"] = df["fabric_parsed"].apply(compute_premium_fiber_pct)
+
     for material in all_materials:
         df[material] = df["fabric_parsed"].apply(lambda x: x.get(material, 0))
 
@@ -235,6 +239,201 @@ def visualize_clusters(df: pd.DataFrame, X) -> None:
     print(f"Explained variance: PC1={var[0]*100:.1f}%, PC2={var[1]*100:.1f}%, total={var.sum()*100:.1f}%")
     print("Plot saved as cluster_plot.png\n")
 
+# Fibers considered "premium" for the purposes of a derived quality signal - long-staple
+# cottons, fine animal fibers, and other fibers generally priced/marketed at a premium
+# over their generic counterparts (plain cotton, polyester, nylon, etc.)
+PREMIUM_FIBERS = {
+    "pima cotton", "egyptian cotton", "combed cotton", "organic cotton",
+    "merino wool", "cashmere", "mohair", "alpaca", "camel hair", "yak wool",
+    "silk", "leather", "tencel/lyocell",
+}
+
+def compute_premium_fiber_pct(fabric_parsed: dict) -> float:
+    """Sums the % composition of any fiber in PREMIUM_FIBERS for a single product."""
+    return sum(pct for fiber, pct in fabric_parsed.items() if fiber in PREMIUM_FIBERS)
+
+# --- Product type normalization ---------------------------------------------
+
+# Same allowlist approach as FIBER_VOCABULARY: raw PRODUCT TYPE values are wildly
+# inconsistent (casing, plurals, brand-specific taxonomies, delivery-season labels
+# like "Fall 2026- Delivery 2"). Mapping to a known, bounded set of apparel
+# categories scales better than trying to normalize casing/plurals/synonyms by hand.
+PRODUCT_TYPE_VOCABULARY = [
+    ("Dresses",           [r"\bdress"]),
+    ("Outerwear",         [r"\bjacket", r"\bblazer\b", r"\bvest\b", r"\bouterwear\b",
+                            r"\bcoat", r"\bnoragi\b", r"\bhappi\b", r"\bdougi\b"]),
+    ("Knitwear & Sweats",  [r"\bknitwear\b", r"\bsweater\b", r"\bhoodie\b",
+                             r"\bsweatshirt\b", r"\bfleece\b"]),
+    ("Bottoms",            [r"\bpants?\b", r"\bjeans?\b", r"\bshorts?\b", r"\bskirt",
+                             r"\bsweatpants?\b", r"\bbottoms?\b"]),
+    ("Tops",               [r"\bshirt", r"\bblouse", r"\btee\b", r"\bt-?shirt",
+                             r"\btank\b", r"\bpolo\b", r"\btops?\b"]),
+    ("Footwear",           [r"\bshoes?\b", r"\bslides?\b", r"\bsneaker",
+                             r"\bbasketball shoes\b", r"\brunning shoes\b"]),
+    ("Bags",               [r"\bbag\b", r"\btote\b", r"\bduffle\b", r"\bclutch\b",
+                             r"\bhandbag\b", r"\bwallet\b"]),
+    ("Jewelry",            [r"\bjewelry\b", r"\bnecklace\b", r"\bearring",
+                             r"\brings?\b", r"\bbracelet\b", r"\bpendant\b"]),
+    ("Swim & Intimates",   [r"\bswimwear\b", r"\bbra\b", r"\bbriefs?\b"]),
+    ("Accessories",        [r"\baccessor", r"\bbelt\b", r"\bgloves?\b", r"\bcap\b",
+                             r"\bhats?\b", r"\bbeanie\b", r"\bbucket hat\b",
+                             r"\bhair accessories\b", r"\bscarf\b", r"\bheadband\b"]),
+    ("Non-Apparel",        [r"\bkitchen\b", r"\bcosmetics\b", r"\bsticker\b",
+                             r"\bcup\b", r"\bfuroshiki\b", r"\bbeauty\b"]),
+]
+
+
+def normalize_product_type(raw_type: str):
+    """Maps a raw PRODUCT TYPE value to a canonical apparel category. Returns None
+    for values that don't match any known category (season/delivery labels, stray
+    junk, blank values) so they're excluded from category-based analysis rather
+    than treated as their own noisy one-off category."""
+    if not isinstance(raw_type, str) or not raw_type.strip():
+        return None
+    name = raw_type.lower().strip()
+    for canonical, patterns in PRODUCT_TYPE_VOCABULARY:
+        if any(re.search(p, name) for p in patterns):
+            return canonical
+    return None
+
+
+# --- Price cleanup ------------------------------------------------------------
+
+# Some brands price in a currency other than USD (their storefront's base
+# currency), which corrupts any cross-brand price comparison if left as-is.
+# Flag any brand whose median price is drastically higher than the global median
+# rather than hardcoding brand names, so this generalizes if you add brands later.
+CURRENCY_OUTLIER_THRESHOLD = 15
+ASSUMED_FX_RATE = 1300  # approx KRW->USD; verify actual rate before trusting this
+
+# Some brands list a placeholder price for "not for sale" items (e.g. samples,
+# giveaways) rather than omitting a price entirely. Filter these out.
+PLACEHOLDER_PRICE_SENTINELS = {9999, 99999, 0}
+
+
+def clean_prices(df: pd.DataFrame) -> pd.DataFrame:
+    """Flags and roughly converts currency-outlier brands, and drops placeholder
+    'not for sale' prices, into a new PRICE_USD column."""
+    df = df.copy()
+    df["PRICE"] = pd.to_numeric(df["PRICE"], errors="coerce")
+    df = df[~df["PRICE"].isin(PLACEHOLDER_PRICE_SENTINELS)]
+    df = df.dropna(subset=["PRICE"]).reset_index(drop=True)
+
+    global_median = df["PRICE"].median()
+    brand_medians = df.groupby("BRAND")["PRICE"].median()
+    outlier_brands = brand_medians[brand_medians > global_median * CURRENCY_OUTLIER_THRESHOLD].index.tolist()
+
+    df["PRICE_USD"] = df["PRICE"]
+    if outlier_brands:
+        print(f"Currency scale outliers detected (likely non-USD): {outlier_brands}")
+        print(f"Applying assumed conversion of /{ASSUMED_FX_RATE} - verify the real rate before trusting this.\n")
+        mask = df["BRAND"].isin(outlier_brands)
+        df.loc[mask, "PRICE_USD"] = df.loc[mask, "PRICE"] / ASSUMED_FX_RATE
+
+    return df
+
+
+# --- Price tier clustering -----------------------------------------------------
+
+MIN_PRODUCTS_FOR_PRICE_CLUSTERING = 8
+PRICE_TIERS = 3  # Budget / Mid-range / Premium
+
+
+def cluster_prices_by_type(df: pd.DataFrame, n_tiers: int = PRICE_TIERS,
+                            min_products: int = MIN_PRODUCTS_FOR_PRICE_CLUSTERING) -> pd.DataFrame:
+    """For each normalized product type with enough data, runs K-Means on
+    log-transformed price (log handles the right-skew typical of pricing data) to
+    split products into price tiers, relabeled in ascending price order so labels
+    are meaningful (Budget/Mid-range/Premium) instead of arbitrary cluster IDs."""
+    df = df.copy()
+    df["price_tier"] = None
+
+    for ptype, group in df.groupby("PRODUCT_TYPE_NORMALIZED"):
+        if ptype is None or len(group) < min_products:
+            continue
+        prices = group["PRICE_USD"].dropna()
+        if len(prices) < min_products:
+            continue
+
+        log_prices = np.log1p(prices.values).reshape(-1, 1)
+        k = min(n_tiers, prices.nunique())
+        kmeans = KMeans(n_clusters=k, init="k-means++", random_state=42, n_init=10)
+        raw_labels = kmeans.fit_predict(log_prices)
+
+        cluster_means = pd.Series(kmeans.cluster_centers_.flatten(), index=range(k))
+        rank_order = cluster_means.sort_values().index.tolist()
+        tier_names = ["Budget", "Mid-range", "Premium", "Luxury"][:k]
+        label_map = {old_label: tier_names[rank] for rank, old_label in enumerate(rank_order)}
+
+        df.loc[prices.index, "price_tier"] = [label_map[l] for l in raw_labels]
+
+    return df
+
+
+def visualize_price_tiers(df: pd.DataFrame) -> None:
+    """Boxplot of USD price by normalized product type, sorted by median price,
+    with individual products scattered on top (colored by K-Means tier), the
+    median labeled directly on each box, and sample size shown per category."""
+    plotted = df.dropna(subset=["PRODUCT_TYPE_NORMALIZED", "price_tier"])
+    if plotted.empty:
+        print("No product types had enough data to cluster into price tiers.")
+        return
+
+    # sort categories cheapest -> priciest so the plot reads as a progression
+    categories = sorted(
+        plotted["PRODUCT_TYPE_NORMALIZED"].unique(),
+        key=lambda c: plotted[plotted["PRODUCT_TYPE_NORMALIZED"] == c]["PRICE_USD"].median()
+    )
+    tier_colors = {"Budget": "tab:blue", "Mid-range": "tab:orange",
+                    "Premium": "tab:green", "Luxury": "tab:red"}
+
+    fig, ax = plt.subplots(figsize=(13, 7))
+    box_data = [plotted[plotted["PRODUCT_TYPE_NORMALIZED"] == cat]["PRICE_USD"].values
+                for cat in categories]
+    bp = ax.boxplot(box_data, tick_labels=categories, showfliers=False, patch_artist=True)
+    for patch in bp["boxes"]:
+        patch.set_facecolor("whitesmoke")
+        patch.set_edgecolor("gray")
+
+    for i, cat in enumerate(categories, start=1):
+        sub = plotted[plotted["PRODUCT_TYPE_NORMALIZED"] == cat]
+        jitter = np.random.normal(loc=i, scale=0.06, size=len(sub))
+        colors = sub["price_tier"].map(tier_colors)
+        ax.scatter(jitter, sub["PRICE_USD"], c=colors, alpha=0.65, s=22,
+                   zorder=3, edgecolors="none")
+
+        # label the median directly next to its box
+        median = sub["PRICE_USD"].median()
+        ax.annotate(f"${median:,.0f}", xy=(i, median), xytext=(i + 0.32, median),
+                    fontsize=9, fontweight="bold", va="center", color="black")
+
+        # sample size under each category's tick label
+        ax.text(i, -0.06, f"n={len(sub)}", transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=8, color="dimgray")
+
+    ax.set_yscale("log")
+    # Plain base-10 numbers (100, 1,000) instead of scientific "10^2" notation
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda y, _: f"{y:,.0f}"))
+    ax.yaxis.set_minor_formatter(mticker.NullFormatter())  # hides cluttered minor-tick labels
+    ax.set_ylabel("Price (USD, log scale)")
+    ax.set_title("Price Distribution & Tiers by Product Type\n"
+                 "(sorted by median price; dot color = K-Means tier)")
+    ax.set_xticklabels(categories, rotation=35, ha="right")
+
+    legend_handles = [plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=c,
+                                  markersize=8, label=t) for t, c in tier_colors.items()]
+    ax.legend(handles=legend_handles, title="Price tier", loc="upper left")
+
+    plt.tight_layout()
+    plt.savefig(WORKING_DIRECTORY + "\\price_tiers_by_type.png", dpi=130)
+    plt.show()
+    print("Plot saved as price_tiers_by_type.png\n")
+
+    print("Price tier summary by product type:")
+    summary = plotted.groupby(["PRODUCT_TYPE_NORMALIZED", "price_tier"])["PRICE_USD"] \
+                      .agg(["count", "mean", "min", "max"])
+    print(summary)
+
 # Creates a PDF file containig all code from this file
 def create_pdf() -> None:
     pdf = FPDF()
@@ -260,7 +459,7 @@ def main():
         print("Not enough fabric data to cluster. Exiting...")
         return
 
-    # Clustering
+    # Fabric composition clustering
     X, material_names = build_material_matrix(df)
     print(f"List of materials used: {', '.join(sorted(material_names))}\n")
     plot_elbow(X)
@@ -268,6 +467,13 @@ def main():
     visualize_clusters(df, X)
     df.drop(columns=["fabric_parsed"], errors="ignore").to_csv(WORKING_DIRECTORY + '\\' + CLUSTERED_CSV, index=False, encoding="utf-8-sig")
     print(f"Clustered data saved to {WORKING_DIRECTORY + '\\' + CLUSTERED_CSV}")
+
+    # Price tier clustering by product type
+    df_prices = pd.read_csv(WORKING_DIRECTORY + '\\' + OUTPUT_CSV, encoding="utf-8-sig")
+    df_prices["PRODUCT_TYPE_NORMALIZED"] = df_prices["PRODUCT TYPE"].apply(normalize_product_type)
+    df_prices = clean_prices(df_prices)
+    df_prices = cluster_prices_by_type(df_prices)
+    visualize_price_tiers(df_prices)
 
     # # Save code as PDF
     # create_pdf()
