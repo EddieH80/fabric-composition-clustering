@@ -9,6 +9,10 @@ from fpdf import FPDF
 from bs4 import BeautifulSoup
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.model_selection import KFold
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import r2_score
 import matplotlib.ticker as mticker
 
 # Constants
@@ -434,6 +438,85 @@ def visualize_price_tiers(df: pd.DataFrame) -> None:
                       .agg(["count", "mean", "min", "max"])
     print(summary)
 
+# --- Supervised price prediction ------------------------------------------
+
+MIN_PRODUCTS_PER_TYPE_FOR_MODEL = 10   # drop categories too small to model reliably
+MIN_MATERIAL_PRESENCE = 0.05            # keep a material only if it appears in >=5% of products
+
+
+def build_price_model_dataset(df: pd.DataFrame, material_names: list) -> tuple:
+    """Assembles the feature matrix (X) and target (y, raw USD price) for price
+    prediction: normalized fiber percentages + premium_fiber_pct + one-hot encoded
+    product type. Takes the material column names explicitly (from
+    build_material_matrix) rather than inferring them by excluding known
+    non-material columns, since df carries many other columns (PRODUCT NAME, ID,
+    FABRIC COMPOSITION, cluster, price_tier, etc.) that a fragile exclusion list
+    would otherwise sweep in. Drops product types with too few products to model
+    reliably and drops materials too rare to provide reliable signal."""
+    counts = df["PRODUCT_TYPE_NORMALIZED"].value_counts()
+    keep_types = counts[counts >= MIN_PRODUCTS_PER_TYPE_FOR_MODEL].index
+    df = df[df["PRODUCT_TYPE_NORMALIZED"].isin(keep_types)].reset_index(drop=True)
+
+    type_dummies = pd.get_dummies(df["PRODUCT_TYPE_NORMALIZED"], prefix="type")
+    presence = (df[material_names] > 0).mean()
+    material_cols = presence[presence >= MIN_MATERIAL_PRESENCE].index.tolist()
+
+    X = pd.concat([df[material_cols], df[["premium_fiber_pct"]], type_dummies], axis=1)
+    y = df["PRICE_USD"].values
+    return X, y
+
+
+def evaluate_price_model(X: pd.DataFrame, y: np.ndarray, n_splits: int = 5) -> None:
+    """5-fold cross-validated comparison of a Random Forest against a fair
+    per-category-median baseline (baseline is computed from the TRAIN fold only,
+    so there's no leakage). Price is log-transformed for training/prediction and
+    converted back to USD for error reporting, since price is right-skewed."""
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    ptype_cols = [c for c in X.columns if c.startswith("type_")]
+    # recover the category label per row from the one-hot columns, for the baseline
+    ptype = X[ptype_cols].idxmax(axis=1).str.replace("type_", "", regex=False).values
+
+    mae_base, r2_base, mae_rf, r2_rf = [], [], [], []
+    for train_idx, test_idx in kf.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        ptype_train, ptype_test = ptype[train_idx], ptype[test_idx]
+
+        # baseline: median price per product type, fit on train fold only
+        train_medians = pd.Series(y_train).groupby(ptype_train).median()
+        base_pred = pd.Series(ptype_test).map(train_medians).values
+        mae_base.append(mean_absolute_error(y_test, base_pred))
+        r2_base.append(r2_score(y_test, base_pred))
+
+        rf = RandomForestRegressor(n_estimators=300, max_depth=6, min_samples_leaf=4, random_state=42)
+        rf.fit(X_train, np.log1p(y_train))
+        pred = np.expm1(rf.predict(X_test))
+        mae_rf.append(mean_absolute_error(y_test, pred))
+        r2_rf.append(r2_score(y_test, pred))
+
+    print(f"Baseline (category median) - MAE: ${np.mean(mae_base):,.0f}  R2: {np.mean(r2_base):.3f}")
+    print(f"Random Forest              - MAE: ${np.mean(mae_rf):,.0f}  R2: {np.mean(r2_rf):.3f}")
+    improvement = 100 * (1 - np.mean(mae_rf) / np.mean(mae_base))
+    print(f"Random Forest reduces MAE by {improvement:.1f}% vs. the category-median baseline\n")
+
+
+def plot_price_feature_importance(X: pd.DataFrame, y: np.ndarray, top_n: int = 12) -> None:
+    """Fits a Random Forest on the full dataset (for interpretation, not evaluation
+    - evaluate_price_model already reports honest out-of-sample performance) and
+    plots the top features driving its price predictions."""
+    rf = RandomForestRegressor(n_estimators=300, max_depth=6, min_samples_leaf=4, random_state=42)
+    rf.fit(X, np.log1p(y))
+    importances = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=True).tail(top_n)
+
+    plt.figure(figsize=(8, 6))
+    plt.barh(importances.index, importances.values, color="steelblue")
+    plt.xlabel("Feature importance")
+    plt.title("What Predicts Price? (Random Forest feature importance)")
+    plt.tight_layout()
+    plt.savefig(WORKING_DIRECTORY + "\\price_feature_importance.png", dpi=130)
+    plt.show()
+    print("Plot saved as price_feature_importance.png\n")
+
 # Creates a PDF file containig all code from this file
 def create_pdf() -> None:
     pdf = FPDF()
@@ -460,20 +543,30 @@ def main():
         return
 
     # Fabric composition clustering
-    X, material_names = build_material_matrix(df)
+    fabric_X, material_names = build_material_matrix(df)
     print(f"List of materials used: {', '.join(sorted(material_names))}\n")
-    plot_elbow(X)
-    df = run_kmeans_clustering(df, X, n_clusters=N_CLUSTERS)
-    visualize_clusters(df, X)
+    plot_elbow(fabric_X)
+    df = run_kmeans_clustering(df, fabric_X, n_clusters=N_CLUSTERS)
+    visualize_clusters(df, fabric_X)
     df.drop(columns=["fabric_parsed"], errors="ignore").to_csv(WORKING_DIRECTORY + '\\' + CLUSTERED_CSV, index=False, encoding="utf-8-sig")
     print(f"Clustered data saved to {WORKING_DIRECTORY + '\\' + CLUSTERED_CSV}")
 
     # Price tier clustering by product type
-    df_prices = pd.read_csv(WORKING_DIRECTORY + '\\' + OUTPUT_CSV, encoding="utf-8-sig")
-    df_prices["PRODUCT_TYPE_NORMALIZED"] = df_prices["PRODUCT TYPE"].apply(normalize_product_type)
-    df_prices = clean_prices(df_prices)
-    df_prices = cluster_prices_by_type(df_prices)
-    visualize_price_tiers(df_prices)
+    # NOTE: this now reuses the same `df` from the fabric-clustering step above
+    # (rather than re-reading the CSV into a separate df_prices) so that
+    # PRODUCT_TYPE_NORMALIZED and PRICE_USD end up on the same DataFrame that
+    # already has the fiber columns and premium_fiber_pct - build_price_model_dataset
+    # below needs all of these present on one DataFrame at once.
+    df["PRODUCT_TYPE_NORMALIZED"] = df["PRODUCT TYPE"].apply(normalize_product_type)
+    df = clean_prices(df)
+    df = cluster_prices_by_type(df)
+    visualize_price_tiers(df)
+
+    # Supervised price prediction
+    price_X, price_y = build_price_model_dataset(df, material_names)
+    print(f"Price model dataset: {price_X.shape[0]} products, {price_X.shape[1]} features\n")
+    evaluate_price_model(price_X, price_y)
+    plot_price_feature_importance(price_X, price_y)
 
     # # Save code as PDF
     # create_pdf()
