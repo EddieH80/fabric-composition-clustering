@@ -6,3 +6,5 @@ Version control for k-means clustering on different fabric compositions for prod
 ![Cluster graph for fabric composition of products](/cluster_plot.png)
 
 ![Price tiers of different products by type](/price_tiers_by_type.png)
+
+![Graph of price prediction supervised learning](/price_feature_importance.png)
